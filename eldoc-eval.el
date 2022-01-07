@@ -1,9 +1,8 @@
-;;; eldoc-eval.el --- Enable eldoc support when minibuffer is in use.
+;;; eldoc-eval.el --- Enable eldoc support when minibuffer is in use. -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2011, 2012, 2013 Free Software Foundation, Inc.
 
 ;; Author: Thierry Volpiatto <thierry.volpiatto@gmail.com>
-;; Version: 0.1
 
 ;; This file is part of GNU Emacs.
 
@@ -51,6 +50,14 @@
 
 ;;; Code:
 (require 'eldoc)
+(eval-and-compile
+  (when (require 'elisp-mode nil t)      ; emacs-25
+    (defalias 'eldoc-current-symbol 'elisp--current-symbol)
+    (defalias 'eldoc-fnsym-in-current-sexp 'elisp--fnsym-in-current-sexp)
+    (defalias 'eldoc-get-fnsym-args-string 'elisp-get-fnsym-args-string)
+    (defalias 'eldoc-get-var-docstring 'elisp-get-var-docstring)))
+
+(defvar composition-function-table)
 
 ;;; Minibuffer support.
 ;;  Enable displaying eldoc info in something else
@@ -77,6 +84,14 @@ Should take one arg: the string to display"
   "Whether minibuffer has its own frame or not."
   :type 'boolean)
 
+(defcustom eldoc-in-minibuffer-mode-lighter " Eldoc-eval"
+  "String displayed in mode-line when `eldoc-in-minibuffer-mode' is enabled."
+  :type 'string)
+
+(defcustom eldoc-mode-line-stop-rolling-on-input t
+  "When rolling mode-line is enabled, stop rolling on input when non--nil."
+  :type 'boolean)
+
 ;;; Compatibility with Emacs-24.4
 ;; New implementation of eldoc in minibuffer that come
 ;; with Emacs-24.4 show the eldoc info of current-buffer while
@@ -84,6 +99,40 @@ Should take one arg: the string to display"
 ;;
 (defconst eldoc-eval--old-message-function
   (and (boundp 'eldoc-message-function) eldoc-message-function))
+
+;; Internal.
+(defvar eldoc-active-minibuffers-list nil
+  "List of active minibuffers with eldoc enabled.")
+(defvar eldoc-mode-line-rolling-flag nil)
+
+(defvar eldoc-in-minibuffer-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [remap eval-expression] 'eldoc-eval-expression)
+    map))
+
+;;;###autoload
+(define-minor-mode eldoc-in-minibuffer-mode
+    "Show eldoc for current minibuffer input."
+  :global t
+  :group 'eldoc-eval
+  (if eldoc-in-minibuffer-mode
+      (progn
+        (add-hook 'minibuffer-exit-hook
+                  (lambda ()
+                    (setq eldoc-mode-line-rolling-flag nil)))
+        (when (boundp 'eldoc-post-insert-mode)
+          (setq eldoc-message-function 'message)
+          (remove-hook 'eval-expression-minibuffer-setup-hook
+                       'eldoc-post-insert-mode))
+        (define-key minibuffer-local-map (kbd "C-@")
+          'eldoc-mode-line-toggle-rolling)
+        (setq eldoc-minor-mode-string eldoc-in-minibuffer-mode-lighter))
+      (setq eldoc-minor-mode-string " Eldoc")
+      (when (boundp 'eldoc-post-insert-mode)
+        (setq eldoc-message-function eldoc-eval--old-message-function)
+        (add-hook 'eval-expression-minibuffer-setup-hook
+                  'eldoc-post-insert-mode))
+      (define-key minibuffer-local-map (kbd "C-@") 'set-mark-command)))
 
 (defadvice eldoc-display-message-no-interference-p
     (after eldoc-eval activate)
@@ -95,11 +144,6 @@ Should take one arg: the string to display"
                (not cursor-in-echo-area)
                (not (eq (selected-window) (minibuffer-window)))))))
 
-;; Internal.
-(defvar eldoc-active-minibuffers-list nil
-  "List of active minibuffers with eldoc enabled.")
-(defvar eldoc-mode-line-rolling-flag nil)
-
 (defun eldoc-store-minibuffer ()
   "Store minibuffer buffer name in `eldoc-active-minibuffers-list'.
 This function is called by each minibuffer started with eldoc support.
@@ -110,22 +154,23 @@ See `with-eldoc-in-minibuffer'."
 (defmacro with-eldoc-in-minibuffer (&rest body)
   "Enable eldoc support for minibuffer input that runs in BODY."
   (declare (indent 0) (debug t))
-  `(let ((timer (and eldoc-in-minibuffer-mode
-                     (run-with-idle-timer
-                      eldoc-idle-delay
-                      'repeat #'eldoc-run-in-minibuffer))))
-     (unwind-protect
-         (minibuffer-with-setup-hook
-             ;; When minibuffer is activated in body, store it.
-             #'eldoc-store-minibuffer
-           ,@body)
-       (and timer (cancel-timer timer))
-       ;; Each time a minibuffer exits or aborts
-       ;; its buffer is removed from stack,
-       ;; assuming we can only exit the active minibuffer
-       ;; on top of stack.
-       (setq eldoc-active-minibuffers-list
-             (cdr eldoc-active-minibuffers-list)))))
+  (let ((timer (make-symbol "eldoc-eval--timer")))
+    `(let ((,timer (and eldoc-in-minibuffer-mode
+                       (run-with-idle-timer
+                        eldoc-idle-delay
+                        'repeat #'eldoc-run-in-minibuffer))))
+       (unwind-protect
+            (minibuffer-with-setup-hook
+                ;; When minibuffer is activated in body, store it.
+                #'eldoc-store-minibuffer
+              ,@body)
+         (and ,timer (cancel-timer ,timer))
+         ;; Each time a minibuffer exits or aborts
+         ;; its buffer is removed from stack,
+         ;; assuming we can only exit the active minibuffer
+         ;; on top of stack.
+         (setq eldoc-active-minibuffers-list
+               (cdr eldoc-active-minibuffers-list))))))
 
 (defun eldoc-current-buffer ()
   "Return the current buffer prior to activating the minibuffer."
@@ -138,27 +183,45 @@ See `with-eldoc-in-minibuffer'."
              'above (minibuffer-window)))
            (t (minibuffer-selected-window))))))
 
-(defun eldoc-show-in-mode-line (str)
-  "Display string STR in the mode-line next to minibuffer."
-  (let (mode-line-in-non-selected-windows)
-    (with-current-buffer (eldoc-current-buffer)
-      (make-local-variable 'mode-line-format)
-      (let ((mode-line-format (concat " " str)))
-        (eldoc-maybe-roll-message-in-mode-line mode-line-format))
-      (force-mode-line-update))))
+(defun eldoc-eval--get-string (str)
+  ;; Avoid error when ligature-mode is enabled. The error comes from
+  ;; composite.c.
+  ;; (error "Attempt to shape unibyte text"). This happen when string
+  ;; comes with [...] at end.
+  (with-temp-buffer
+    (let ((composition-function-table
+           (default-value 'composition-function-table)))
+      (when (stringp str)
+        (insert str)
+        (buffer-string)))))
 
-(defun eldoc-maybe-roll-message-in-mode-line (str)
-  (let* ((max (window-width (get-buffer-window (eldoc-current-buffer))))
-         (len (length str))
-         (tmp-str str))
-    (if (and (> len max) eldoc-mode-line-rolling-flag)
-        (while (sit-for 0.3)
-           (setq tmp-str (substring tmp-str 2)
-                 mode-line-format (concat tmp-str " [<]" str))
-           (force-mode-line-update nil)
-           (when (< (length tmp-str) 2) (setq tmp-str str)))
-        (force-mode-line-update nil)
-        (sit-for eldoc-show-in-mode-line-delay))))
+(defun eldoc-show-in-mode-line (input)
+  "Display string STR in the mode-line next to minibuffer."
+  (with-current-buffer (eldoc-current-buffer)
+    (let* ((max              (window-width (selected-window)))
+           (str              (and (stringp input) (concat " " input)))
+           (len              (length str))
+           (tmp-str          str)
+           (mode-line-format
+            (or (eldoc-eval--get-string str)
+                mode-line-format))
+           roll mode-line-in-non-selected-windows)
+      (catch 'break
+        (if (and (> len max) eldoc-mode-line-rolling-flag)
+            (progn
+              (while (setq roll (sit-for 0.3))
+                (setq tmp-str (substring tmp-str 2)
+                      mode-line-format (eldoc-eval--get-string
+                                        (concat tmp-str " [<]" str)))
+                (force-mode-line-update)
+                (when (< (length tmp-str) 2) (setq tmp-str str)))
+              (unless roll
+                (when eldoc-mode-line-stop-rolling-on-input
+                  (setq eldoc-mode-line-rolling-flag nil))
+                (throw 'break nil)))
+            (force-mode-line-update)
+            (sit-for eldoc-show-in-mode-line-delay))))
+    (force-mode-line-update)))
 
 (defun eldoc-mode-line-toggle-rolling ()
   (interactive)
@@ -167,51 +230,25 @@ See `with-eldoc-in-minibuffer'."
       (setq eldoc-mode-line-rolling-flag (not eldoc-mode-line-rolling-flag))
       (error "No active minibuffer found")))
 
-(defvar eldoc-in-minibuffer-mode-map
-  (let ((map (make-sparse-keymap)))
-    ;; FIXME: Should we use [remap eval-expression] instead?
-    (define-key map (kbd "M-:") 'eldoc-eval-expression)
-    map))
-
-;;;###autoload
-(define-minor-mode eldoc-in-minibuffer-mode
-    "Show eldoc for current minibuffer input."
-  :global t
-  (if eldoc-in-minibuffer-mode
-      (progn
-        (add-hook 'minibuffer-exit-hook
-                  (lambda ()
-                    (setq eldoc-mode-line-rolling-flag nil)))
-        (and (boundp 'eldoc-message-function)
-             (setq eldoc-message-function 'message))
-        (define-key minibuffer-local-map (kbd "C-@")
-          'eldoc-mode-line-toggle-rolling)
-        (setq eldoc-minor-mode-string " Eldoc-eval"))
-      (setq eldoc-minor-mode-string " Eldoc")
-      (and (boundp 'eldoc-message-function)
-           (setq eldoc-message-function eldoc-eval--old-message-function))
-      (define-key minibuffer-local-map (kbd "C-@") 'set-mark-command)))
-
 (defun eldoc-run-in-minibuffer ()
   (let ((buf (window-buffer (active-minibuffer-window))))
     ;; If this minibuffer have been started with
     ;;`with-eldoc-in-minibuffer' give it eldoc support
     ;; and update mode-line, otherwise do nothing.
-    (condition-case err
+    (condition-case _err
         (when (member buf eldoc-active-minibuffers-list)
           (with-current-buffer buf
             (let* ((sym (save-excursion
-                          (unless (looking-back ")\\|\"")
+                          (unless (looking-back ")\\|\"" (1- (point)))
                             (forward-char -1))
                           (eldoc-current-symbol)))
                    (info-fn (eldoc-fnsym-in-current-sexp))
                    (doc     (or (eldoc-get-var-docstring sym)
                                 (eldoc-get-fnsym-args-string
                                  (car info-fn) (cadr info-fn)))))
-              (when doc (funcall eldoc-in-minibuffer-show-fn doc)))))
+              (funcall eldoc-in-minibuffer-show-fn (or doc 1)))))
       (scan-error nil)
-      (beginning-of-buffer nil)
-      (error (message "Eldoc in minibuffer error: %S" err)))))
+      (beginning-of-buffer nil))))
 
 ;;;###autoload
 (defun eldoc-eval-expression ()
